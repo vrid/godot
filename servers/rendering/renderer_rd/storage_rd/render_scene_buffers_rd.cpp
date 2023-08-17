@@ -101,6 +101,12 @@ void RenderSceneBuffersRD::cleanup() {
 		free_named_texture(E.value);
 	}
 	named_textures.clear();
+
+	// Destroy FSR2 context.
+	if (fsr2_context) {
+		memdelete(fsr2_context);
+		fsr2_context = nullptr;
+	}
 }
 
 void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_config) {
@@ -128,6 +134,11 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
 		// This restores sharpness in still images to be roughly at the same level as without TAA,
 		// but moving scenes will still be blurrier.
 		texture_mipmap_bias -= 0.5;
+	}
+
+	if (scaling_3d_mode == RS::VIEWPORT_SCALING_3D_MODE_FSR2) {
+		// Same reasoning as TAA, except AMD recommends this bias instead.
+		texture_mipmap_bias -= 1.0;
 	}
 
 	if (screen_space_aa == RS::VIEWPORT_SCREEN_SPACE_AA_FXAA) {
@@ -387,6 +398,10 @@ const RD::TextureFormat RenderSceneBuffersRD::get_texture_format(const StringNam
 }
 
 RID RenderSceneBuffersRD::get_texture_slice(const StringName &p_context, const StringName &p_texture_name, const uint32_t p_layer, const uint32_t p_mipmap, const uint32_t p_layers, const uint32_t p_mipmaps) {
+	return get_texture_slice_view(p_context, p_texture_name, p_layer, p_mipmap, p_layers, p_mipmaps, RD::TextureView());
+}
+
+RID RenderSceneBuffersRD::get_texture_slice_view(const StringName &p_context, const StringName &p_texture_name, const uint32_t p_layer, const uint32_t p_mipmap, const uint32_t p_layers, const uint32_t p_mipmaps, RD::TextureView p_view) {
 	NTKey key(p_context, p_texture_name);
 
 	// check if this is a known texture
@@ -403,19 +418,20 @@ RID RenderSceneBuffersRD::get_texture_slice(const StringName &p_context, const S
 	ERR_FAIL_COND_V(p_mipmap + p_mipmaps > named_texture.format.mipmaps, RID());
 
 	// asking the whole thing? just return the original
-	if (p_layer == 0 && p_mipmap == 0 && named_texture.format.array_layers == p_layers && named_texture.format.mipmaps == p_mipmaps) {
+	RD::TextureView default_view = RD::TextureView();
+	if (p_layer == 0 && p_mipmap == 0 && named_texture.format.array_layers == p_layers && named_texture.format.mipmaps == p_mipmaps && p_view == default_view) {
 		return named_texture.texture;
 	}
 
 	// see if we have this
-	NTSliceKey slice_key(p_layer, p_layers, p_mipmap, p_mipmaps);
+	NTSliceKey slice_key(p_layer, p_layers, p_mipmap, p_mipmaps, p_view);
 	if (named_texture.slices.has(slice_key)) {
 		return named_texture.slices[slice_key];
 	}
 
 	// create our slice
 	RID &slice = named_texture.slices[slice_key];
-	slice = RD::get_singleton()->texture_create_shared_from_slice(RD::TextureView(), named_texture.texture, p_layer, p_mipmap, p_mipmaps, p_layers > 1 ? RD::TEXTURE_SLICE_2D_ARRAY : RD::TEXTURE_SLICE_2D, p_layers);
+	slice = RD::get_singleton()->texture_create_shared_from_slice(p_view, named_texture.texture, p_layer, p_mipmap, p_mipmaps, p_layers > 1 ? RD::TEXTURE_SLICE_2D_ARRAY : RD::TEXTURE_SLICE_2D, p_layers);
 
 	Array arr;
 	arr.push_back(p_context);
@@ -424,7 +440,12 @@ RID RenderSceneBuffersRD::get_texture_slice(const StringName &p_context, const S
 	arr.push_back(itos(p_layers));
 	arr.push_back(itos(p_mipmap));
 	arr.push_back(itos(p_mipmaps));
-	RD::get_singleton()->set_resource_name(slice, String("RenderBuffer {0}/{1}, layer {2}/{3}, mipmap {4}/{5}").format(arr));
+	arr.push_back(itos(p_view.format_override));
+	arr.push_back(itos(p_view.swizzle_r));
+	arr.push_back(itos(p_view.swizzle_g));
+	arr.push_back(itos(p_view.swizzle_b));
+	arr.push_back(itos(p_view.swizzle_a));
+	RD::get_singleton()->set_resource_name(slice, String("RenderBuffer {0}/{1}, layer {2}/{3}, mipmap {4}/{5}, view {6}/{7}/{8}/{9}/{10}").format(arr));
 
 	// and return our slice
 	return slice;
@@ -590,6 +611,24 @@ RID RenderSceneBuffersRD::get_depth_texture(const uint32_t p_layer) {
 		return depth_slice;
 	} else {
 		return get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_DEPTH, p_layer, 0);
+	}
+}
+
+// FSR2.
+
+void RenderSceneBuffersRD::ensure_fsr2(RendererRD::FSR2Effect *effect) {
+	if (fsr2_context == nullptr) {
+		fsr2_context = effect->create_context(internal_size, target_size);
+	}
+}
+
+// Upscaled texture.
+
+void RenderSceneBuffersRD::ensure_upscaled() {
+	if (!has_upscaled_texture()) {
+		uint32_t usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | (can_be_storage ? RD::TEXTURE_USAGE_STORAGE_BIT : 0) | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT;
+		usage_bits |= RD::TEXTURE_USAGE_INPUT_ATTACHMENT_BIT;
+		create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED, base_data_format, usage_bits, RD::TEXTURE_SAMPLES_1, target_size);
 	}
 }
 
